@@ -100,6 +100,7 @@ type Raft struct {
 
 	// election bookkeeping
 	electionResetAt time.Time
+	electionTimeout time.Duration // fixed once per reset, re-rolled on each reset
 
 	// apply pipeline
 	applyCh   chan ApplyMsg
@@ -251,9 +252,17 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && upToDate {
 		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
-		rf.electionResetAt = time.Now()
+		rf.resetElectionTimer()
 		rf.persist()
 	}
+}
+
+// resetElectionTimer restarts the election countdown with a fresh random
+// deadline. Caller holds rf.mu.
+func (rf *Raft) resetElectionTimer() {
+	rf.electionResetAt = time.Now()
+	rf.electionTimeout = electionTimeoutLo +
+		time.Duration(rand.Int63n(int64(electionTimeoutHi-electionTimeoutLo)))
 }
 
 // candidateUpToDate implements the "at least as up-to-date" comparison
@@ -308,7 +317,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	// Valid leader for this term: reset election timer and ensure follower role.
 	rf.role = Follower
-	rf.electionResetAt = time.Now()
+	rf.resetElectionTimer()
 
 	// If PrevLogIndex is inside the snapshot, we can't verify it directly.
 	if args.PrevLogIndex < rf.lastIncludedIndex {
@@ -406,7 +415,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		reply.Term = rf.currentTerm
 	}
 	rf.role = Follower
-	rf.electionResetAt = time.Now()
+	rf.resetElectionTimer()
 
 	// Ignore stale snapshots.
 	if args.LastIncludedIndex <= rf.lastIncludedIndex {
@@ -495,12 +504,11 @@ func (rf *Raft) ticker() {
 	for rf.killed() == false {
 		time.Sleep(10 * time.Millisecond)
 		rf.mu.Lock()
-		if rf.role != Leader {
-			timeout := electionTimeoutLo +
-				time.Duration(rand.Int63n(int64(electionTimeoutHi-electionTimeoutLo)))
-			if time.Since(rf.electionResetAt) >= timeout {
-				rf.startElection()
-			}
+		// Use the deadline fixed at the last reset (not a fresh roll each tick),
+		// so the timeout distribution is uniform and elections aren't triggered
+		// too eagerly.
+		if rf.role != Leader && time.Since(rf.electionResetAt) >= rf.electionTimeout {
+			rf.startElection()
 		}
 		rf.mu.Unlock()
 	}
@@ -511,7 +519,7 @@ func (rf *Raft) startElection() {
 	rf.role = Candidate
 	rf.currentTerm++
 	rf.votedFor = rf.me
-	rf.electionResetAt = time.Now()
+	rf.resetElectionTimer()
 	rf.persist()
 
 	term := rf.currentTerm
@@ -771,7 +779,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.role = Follower
 	rf.applyCh = applyCh
 	rf.applyCond = sync.NewCond(&rf.mu)
-	rf.electionResetAt = time.Now()
+	rf.resetElectionTimer()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
