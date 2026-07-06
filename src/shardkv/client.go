@@ -13,6 +13,7 @@ import "crypto/rand"
 import "math/big"
 import "6.5840/shardctrler"
 import "time"
+import "sync/atomic"
 
 // which shard is a key in?
 // please use this function,
@@ -37,37 +38,31 @@ type Clerk struct {
 	sm       *shardctrler.Clerk
 	config   shardctrler.Config
 	make_end func(string) *labrpc.ClientEnd
-	// You will have to modify this struct.
+	clientId int64
+	seq      int64
 }
 
 // the tester calls MakeClerk.
-//
-// ctrlers[] is needed to call shardctrler.MakeClerk().
-//
-// make_end(servername) turns a server name from a
-// Config.Groups[gid][i] into a labrpc.ClientEnd on which you can
-// send RPCs.
 func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.sm = shardctrler.MakeClerk(ctrlers)
 	ck.make_end = make_end
-	// You'll have to add code here.
+	ck.clientId = nrand()
 	return ck
 }
 
-// fetch the current value for a key.
-// returns "" if the key does not exist.
-// keeps trying forever in the face of all other errors.
-// You will have to modify this function.
+func (ck *Clerk) nextSeq() int64 {
+	return atomic.AddInt64(&ck.seq, 1)
+}
+
+// fetch the current value for a key. returns "" if the key does not exist.
 func (ck *Clerk) Get(key string) string {
-	args := GetArgs{}
-	args.Key = key
+	args := GetArgs{Key: key, ClientId: ck.clientId, Seq: ck.nextSeq()}
 
 	for {
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
 		if servers, ok := ck.config.Groups[gid]; ok {
-			// try each server for the shard.
 			for si := 0; si < len(servers); si++ {
 				srv := ck.make_end(servers[si])
 				var reply GetReply
@@ -78,25 +73,17 @@ func (ck *Clerk) Get(key string) string {
 				if ok && (reply.Err == ErrWrongGroup) {
 					break
 				}
-				// ... not ok, or ErrWrongLeader
+				// not ok, ErrWrongLeader, ErrTimeout, or ErrNotReady: try next.
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
-		// ask controller for the latest configuration.
 		ck.config = ck.sm.Query(-1)
 	}
-
-	return ""
 }
 
 // shared by Put and Append.
-// You will have to modify this function.
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	args := PutAppendArgs{}
-	args.Key = key
-	args.Value = value
-	args.Op = op
-
+	args := PutAppendArgs{Key: key, Value: value, Op: op, ClientId: ck.clientId, Seq: ck.nextSeq()}
 
 	for {
 		shard := key2shard(key)
@@ -112,11 +99,10 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				if ok && reply.Err == ErrWrongGroup {
 					break
 				}
-				// ... not ok, or ErrWrongLeader
+				// not ok, ErrWrongLeader, ErrTimeout, or ErrNotReady: try next.
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
-		// ask controller for the latest configuration.
 		ck.config = ck.sm.Query(-1)
 	}
 }
