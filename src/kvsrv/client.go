@@ -3,11 +3,14 @@ package kvsrv
 import "6.5840/labrpc"
 import "crypto/rand"
 import "math/big"
-
+import "sync/atomic"
 
 type Clerk struct {
 	server *labrpc.ClientEnd
-	// You will have to modify this struct.
+	// clientId uniquely identifies this Clerk; seq is a per-client monotonic
+	// counter so the server can de-duplicate retried Put/Append RPCs.
+	clientId int64
+	seq      int64
 }
 
 func nrand() int64 {
@@ -20,37 +23,46 @@ func nrand() int64 {
 func MakeClerk(server *labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.server = server
-	// You'll have to add code here.
+	ck.clientId = nrand()
 	return ck
 }
 
-// fetch the current value for a key.
-// returns "" if the key does not exist.
-// keeps trying forever in the face of all other errors.
-//
-// you can send an RPC with code like this:
-// ok := ck.server.Call("KVServer.Get", &args, &reply)
-//
-// the types of args and reply (including whether they are pointers)
-// must match the declared types of the RPC handler function's
-// arguments. and reply must be passed as a pointer.
-func (ck *Clerk) Get(key string) string {
-
-	// You will have to modify this function.
-	return ""
+// nextSeq returns a fresh, strictly increasing sequence number for this Clerk.
+func (ck *Clerk) nextSeq() int64 {
+	return atomic.AddInt64(&ck.seq, 1)
 }
 
-// shared by Put and Append.
-//
-// you can send an RPC with code like this:
-// ok := ck.server.Call("KVServer."+op, &args, &reply)
-//
-// the types of args and reply (including whether they are pointers)
-// must match the declared types of the RPC handler function's
-// arguments. and reply must be passed as a pointer.
+// Get fetches the current value for a key, returning "" if the key is absent.
+// It retries forever until it gets a reply, because the network may drop RPCs.
+func (ck *Clerk) Get(key string) string {
+	args := GetArgs{Key: key}
+	for {
+		reply := GetReply{}
+		if ck.server.Call("KVServer.Get", &args, &reply) {
+			return reply.Value
+		}
+		// RPC failed (dropped request or reply); retry.
+	}
+}
+
+// PutAppend sends a Put or Append and retries until it receives a reply. Every
+// retry carries the same (clientId, seq) so the server applies the mutation at
+// most once. For Append the server returns the value the key held *before* the
+// append.
 func (ck *Clerk) PutAppend(key string, value string, op string) string {
-	// You will have to modify this function.
-	return ""
+	args := PutAppendArgs{
+		Key:      key,
+		Value:    value,
+		ClientId: ck.clientId,
+		Seq:      ck.nextSeq(),
+	}
+	for {
+		reply := PutAppendReply{}
+		if ck.server.Call("KVServer."+op, &args, &reply) {
+			return reply.Value
+		}
+		// RPC failed; retry with the same Seq so a duplicate is detected.
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {
