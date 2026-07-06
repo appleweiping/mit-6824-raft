@@ -1,0 +1,9 @@
+Test (3A): initial election ...
+  ... Passed --   3.0  3   58   16168    0
+Test (3A): election after network failure ...
+  ... Passed --   4.7  3  136   26643    0
+Test (3A): multiple elections ...
+  ... Passed --   5.6  7  690  134634    0
+PASS
+ok  	6.5840/raft	14.344s
+RC=0
