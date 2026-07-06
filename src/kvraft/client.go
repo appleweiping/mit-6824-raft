@@ -3,11 +3,16 @@ package kvraft
 import "6.5840/labrpc"
 import "crypto/rand"
 import "math/big"
-
+import "sync/atomic"
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
-	// You will have to modify this struct.
+	// clientId identifies this Clerk; seq gives each request a unique, strictly
+	// increasing sequence number. leaderHint caches the last known leader to
+	// avoid re-scanning all servers on every call.
+	clientId   int64
+	seq        int64
+	leaderHint int32
 }
 
 func nrand() int64 {
@@ -20,36 +25,51 @@ func nrand() int64 {
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
-	// You'll have to add code here.
+	ck.clientId = nrand()
 	return ck
 }
 
-// fetch the current value for a key.
-// returns "" if the key does not exist.
-// keeps trying forever in the face of all other errors.
-//
-// you can send an RPC with code like this:
-// ok := ck.servers[i].Call("KVServer."+op, &args, &reply)
-//
-// the types of args and reply (including whether they are pointers)
-// must match the declared types of the RPC handler function's
-// arguments. and reply must be passed as a pointer.
-func (ck *Clerk) Get(key string) string {
-
-	// You will have to modify this function.
-	return ""
+func (ck *Clerk) nextSeq() int64 {
+	return atomic.AddInt64(&ck.seq, 1)
 }
 
-// shared by Put and Append.
-//
-// you can send an RPC with code like this:
-// ok := ck.servers[i].Call("KVServer.PutAppend", &args, &reply)
-//
-// the types of args and reply (including whether they are pointers)
-// must match the declared types of the RPC handler function's
-// arguments. and reply must be passed as a pointer.
+// Get fetches the current value for a key ("" if absent). It retries across
+// servers until a leader answers.
+func (ck *Clerk) Get(key string) string {
+	args := GetArgs{Key: key, ClientId: ck.clientId, Seq: ck.nextSeq()}
+	leader := int(atomic.LoadInt32(&ck.leaderHint))
+	for {
+		reply := GetReply{}
+		ok := ck.servers[leader].Call("KVServer.Get", &args, &reply)
+		if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
+			atomic.StoreInt32(&ck.leaderHint, int32(leader))
+			return reply.Value
+		}
+		// Wrong leader, timeout, or dropped RPC: advance to the next server.
+		leader = (leader + 1) % len(ck.servers)
+	}
+}
+
+// PutAppend sends a Put or Append, retrying across servers until a leader
+// commits it. The stable (clientId, seq) makes retries idempotent.
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	// You will have to modify this function.
+	args := PutAppendArgs{
+		Key:      key,
+		Value:    value,
+		Op:       op,
+		ClientId: ck.clientId,
+		Seq:      ck.nextSeq(),
+	}
+	leader := int(atomic.LoadInt32(&ck.leaderHint))
+	for {
+		reply := PutAppendReply{}
+		ok := ck.servers[leader].Call("KVServer."+op, &args, &reply)
+		if ok && reply.Err == OK {
+			atomic.StoreInt32(&ck.leaderHint, int32(leader))
+			return
+		}
+		leader = (leader + 1) % len(ck.servers)
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {

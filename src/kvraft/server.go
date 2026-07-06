@@ -1,28 +1,51 @@
 package kvraft
 
 import (
+	"bytes"
+	"sync"
+	"sync/atomic"
+	"time"
+
 	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raft"
-	"log"
-	"sync"
-	"sync/atomic"
 )
 
 const Debug = false
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
-	if Debug {
-		log.Printf(format, a...)
-	}
 	return
 }
 
+// applyTimeout bounds how long a client RPC waits for its command to be
+// committed and applied before giving up (so the client can retry elsewhere).
+const applyTimeout = 500 * time.Millisecond
 
+// Op is the command replicated through Raft. A single type covers Get/Put/Append.
 type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+	Type     string // "Get", "Put", or "Append"
+	Key      string
+	Value    string
+	ClientId int64
+	Seq      int64
+}
+
+// result is what an applied Op yields, delivered back to the waiting RPC.
+// clientId+seq identify which command actually committed at the index, so a
+// waiter can detect if a *different* command took its slot after a leader change.
+type result struct {
+	err      Err
+	value    string
+	clientId int64
+	seq      int64
+}
+
+// lastReply remembers the outcome of the most recent request per client, for
+// exactly-once semantics across retries and leader changes.
+type lastReply struct {
+	seq   int64
+	value string // Get's returned value / applicable read result
+	err   Err
 }
 
 type KVServer struct {
@@ -33,69 +56,215 @@ type KVServer struct {
 	dead    int32 // set by Kill()
 
 	maxraftstate int // snapshot if log grows this big
+	persister    *raft.Persister
 
-	// Your definitions here.
+	data       map[string]string   // the key/value store
+	dedup      map[int64]lastReply // clientId -> last applied request
+	waiters    map[int]chan result // log index -> waiting RPC channel
+	lastApplied int                // highest log index applied to the state machine
 }
 
+// waitFor submits op to Raft and blocks until it is applied (or times out /
+// leadership is lost). Returns the applied result.
+func (kv *KVServer) waitFor(op Op) result {
+	index, _, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		return result{err: ErrWrongLeader}
+	}
+
+	kv.mu.Lock()
+	ch := make(chan result, 1)
+	kv.waiters[index] = ch
+	kv.mu.Unlock()
+
+	select {
+	case res := <-ch:
+		kv.mu.Lock()
+		delete(kv.waiters, index)
+		kv.mu.Unlock()
+		// If a different command committed at our index (leadership changed
+		// between Start and apply), tell the client to retry.
+		if res.clientId != op.ClientId || res.seq != op.Seq {
+			return result{err: ErrWrongLeader}
+		}
+		return res
+	case <-time.After(applyTimeout):
+		kv.mu.Lock()
+		delete(kv.waiters, index)
+		kv.mu.Unlock()
+		return result{err: ErrTimeout}
+	}
+}
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
+	res := kv.waitFor(Op{
+		Type:     "Get",
+		Key:      args.Key,
+		ClientId: args.ClientId,
+		Seq:      args.Seq,
+	})
+	reply.Err = res.err
+	reply.Value = res.value
 }
 
 func (kv *KVServer) Put(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
+	res := kv.waitFor(Op{
+		Type:     "Put",
+		Key:      args.Key,
+		Value:    args.Value,
+		ClientId: args.ClientId,
+		Seq:      args.Seq,
+	})
+	reply.Err = res.err
 }
 
 func (kv *KVServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
+	res := kv.waitFor(Op{
+		Type:     "Append",
+		Key:      args.Key,
+		Value:    args.Value,
+		ClientId: args.ClientId,
+		Seq:      args.Seq,
+	})
+	reply.Err = res.err
 }
 
-// the tester calls Kill() when a KVServer instance won't
-// be needed again. for your convenience, we supply
-// code to set rf.dead (without needing a lock),
-// and a killed() method to test rf.dead in
-// long-running loops. you can also add your own
-// code to Kill(). you're not required to do anything
-// about this, but it may be convenient (for example)
-// to suppress debug output from a Kill()ed instance.
+// applyLoop consumes committed entries and snapshots from Raft, applies them to
+// the state machine, and wakes any RPC waiting on that log index.
+func (kv *KVServer) applyLoop() {
+	for msg := range kv.applyCh {
+		if kv.killed() {
+			return
+		}
+		if msg.CommandValid {
+			kv.applyCommand(msg)
+		} else if msg.SnapshotValid {
+			kv.applySnapshot(msg)
+		}
+	}
+}
+
+func (kv *KVServer) applyCommand(msg raft.ApplyMsg) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	if msg.CommandIndex <= kv.lastApplied {
+		return
+	}
+	kv.lastApplied = msg.CommandIndex
+
+	op := msg.Command.(Op)
+	var res result
+
+	// De-duplicate mutating operations. Get is idempotent but we still cache
+	// its result to answer retries consistently.
+	last, seen := kv.dedup[op.ClientId]
+	if seen && last.seq >= op.Seq && op.Type != "Get" {
+		res = result{err: last.err, value: last.value}
+	} else {
+		switch op.Type {
+		case "Get":
+			if v, ok := kv.data[op.Key]; ok {
+				res = result{err: OK, value: v}
+			} else {
+				res = result{err: ErrNoKey}
+			}
+		case "Put":
+			kv.data[op.Key] = op.Value
+			res = result{err: OK}
+		case "Append":
+			kv.data[op.Key] += op.Value
+			res = result{err: OK}
+		}
+		if op.Type != "Get" {
+			kv.dedup[op.ClientId] = lastReply{seq: op.Seq, value: res.value, err: res.err}
+		}
+	}
+
+	// Stamp the identity of the command that actually committed here.
+	res.clientId = op.ClientId
+	res.seq = op.Seq
+
+	// Wake the waiting RPC, if this server is the one that proposed it and is
+	// still leader for this index.
+	if ch, ok := kv.waiters[msg.CommandIndex]; ok {
+		ch <- res
+	}
+
+	kv.maybeSnapshot(msg.CommandIndex)
+}
+
+func (kv *KVServer) applySnapshot(msg raft.ApplyMsg) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	if msg.SnapshotIndex <= kv.lastApplied {
+		return
+	}
+	kv.readSnapshot(msg.Snapshot)
+	kv.lastApplied = msg.SnapshotIndex
+}
+
+// maybeSnapshot asks Raft to compact its log once persisted state grows past
+// maxraftstate. Caller holds kv.mu.
+func (kv *KVServer) maybeSnapshot(index int) {
+	if kv.maxraftstate < 0 {
+		return
+	}
+	if kv.persister.RaftStateSize() < kv.maxraftstate {
+		return
+	}
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.data)
+	e.Encode(kv.dedup)
+	kv.rf.Snapshot(index, w.Bytes())
+}
+
+// readSnapshot restores the state machine from a snapshot. Caller holds kv.mu.
+func (kv *KVServer) readSnapshot(data []byte) {
+	if len(data) == 0 {
+		return
+	}
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var kvData map[string]string
+	var dedup map[int64]lastReply
+	if d.Decode(&kvData) != nil || d.Decode(&dedup) != nil {
+		return
+	}
+	kv.data = kvData
+	kv.dedup = dedup
+}
+
 func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
-	// Your code here, if desired.
 }
 
 func (kv *KVServer) killed() bool {
-	z := atomic.LoadInt32(&kv.dead)
-	return z == 1
+	return atomic.LoadInt32(&kv.dead) == 1
 }
 
-// servers[] contains the ports of the set of
-// servers that will cooperate via Raft to
-// form the fault-tolerant key/value service.
-// me is the index of the current server in servers[].
-// the k/v server should store snapshots through the underlying Raft
-// implementation, which should call persister.SaveStateAndSnapshot() to
-// atomically save the Raft state along with the snapshot.
-// the k/v server should snapshot when Raft's saved state exceeds maxraftstate bytes,
-// in order to allow Raft to garbage-collect its log. if maxraftstate is -1,
-// you don't need to snapshot.
-// StartKVServer() must return quickly, so it should start goroutines
-// for any long-running work.
+// StartKVServer starts a fault-tolerant key/value server backed by Raft.
 func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int) *KVServer {
-	// call labgob.Register on structures you want
-	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(Op{})
 
 	kv := new(KVServer)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
+	kv.persister = persister
 
-	// You may need initialization code here.
+	kv.data = make(map[string]string)
+	kv.dedup = make(map[int64]lastReply)
+	kv.waiters = make(map[int]chan result)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
-	// You may need initialization code here.
+	// Restore any snapshot taken before a crash.
+	kv.readSnapshot(persister.ReadSnapshot())
+
+	go kv.applyLoop()
 
 	return kv
 }

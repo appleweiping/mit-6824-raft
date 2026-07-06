@@ -4,6 +4,7 @@ const (
 	OK             = "OK"
 	ErrNoKey       = "ErrNoKey"
 	ErrWrongLeader = "ErrWrongLeader"
+	ErrTimeout     = "ErrTimeout"
 )
 
 type Err string
@@ -12,9 +13,11 @@ type Err string
 type PutAppendArgs struct {
 	Key   string
 	Value string
-	// You'll have to add definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+	Op    string // "Put" or "Append"
+	// ClientId + Seq give each client request a unique identity so the servers
+	// can apply it exactly once even across leader changes and retries.
+	ClientId int64
+	Seq      int64
 }
 
 type PutAppendReply struct {
@@ -22,8 +25,9 @@ type PutAppendReply struct {
 }
 
 type GetArgs struct {
-	Key string
-	// You'll have to add definitions here.
+	Key      string
+	ClientId int64
+	Seq      int64
 }
 
 type GetReply struct {
