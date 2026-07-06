@@ -1,4 +1,35 @@
+# Official skeleton ignores
 pkg/
 api.key
 .api.key.trimmed
 *-handin.tar.gz
+
+# Go build artifacts
+*.so
+src/main/mrcoordinator
+src/main/mrworker
+src/main/mrsequential
+src/main/mr-tmp/
+src/main/mr-out*
+src/main/mr-[0-9]*
+src/main/diag*
+src/main/run/
+src/main/*.log
+
+# MapReduce intermediate/output files
+mr-out-*
+mr-worker-*
+mr-[0-9]*-[0-9]*
+
+# Test/debug scratch
+DIAG*.txt
+RESULT.txt
+
+# Toolchain caches (kept on D:, never committed)
+gocache/
+gomodcache/
+gopath/
+
+# Editor/OS
+.DS_Store
+*.swp

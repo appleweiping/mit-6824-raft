@@ -9,21 +9,37 @@ package mr
 import "os"
 import "strconv"
 
-//
-// example to show how to declare the arguments
-// and reply for an RPC.
-//
+// TaskType distinguishes the kind of work the coordinator hands out.
+type TaskType int
 
-type ExampleArgs struct {
-	X int
+const (
+	TaskNone   TaskType = iota // no task available yet, worker should wait
+	TaskMap                    // a map task
+	TaskReduce                 // a reduce task
+	TaskExit                   // all work is done, worker should exit
+)
+
+// RequestTaskArgs is empty: a worker just asks "give me something to do".
+type RequestTaskArgs struct {
 }
 
-type ExampleReply struct {
-	Y int
+// RequestTaskReply carries a task assignment from the coordinator.
+type RequestTaskReply struct {
+	Type    TaskType
+	TaskID  int    // index of the map or reduce task
+	File    string // input file for a map task
+	NMap    int    // number of map tasks (== number of input files)
+	NReduce int    // number of reduce buckets
 }
 
-// Add your RPC definitions here.
+// ReportTaskArgs tells the coordinator a task has finished.
+type ReportTaskArgs struct {
+	Type   TaskType
+	TaskID int
+}
 
+type ReportTaskReply struct {
+}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
