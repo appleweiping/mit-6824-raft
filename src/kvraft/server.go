@@ -41,11 +41,12 @@ type result struct {
 }
 
 // lastReply remembers the outcome of the most recent request per client, for
-// exactly-once semantics across retries and leader changes.
+// exactly-once semantics across retries and leader changes. Fields are exported
+// because this struct is gob-encoded into the snapshot.
 type lastReply struct {
-	seq   int64
-	value string // Get's returned value / applicable read result
-	err   Err
+	Seq   int64
+	Value string // Append's returned value
+	Err   Err
 }
 
 type KVServer struct {
@@ -159,8 +160,8 @@ func (kv *KVServer) applyCommand(msg raft.ApplyMsg) {
 	// De-duplicate mutating operations. Get is idempotent but we still cache
 	// its result to answer retries consistently.
 	last, seen := kv.dedup[op.ClientId]
-	if seen && last.seq >= op.Seq && op.Type != "Get" {
-		res = result{err: last.err, value: last.value}
+	if seen && last.Seq >= op.Seq && op.Type != "Get" {
+		res = result{err: last.Err, value: last.Value}
 	} else {
 		switch op.Type {
 		case "Get":
@@ -177,7 +178,7 @@ func (kv *KVServer) applyCommand(msg raft.ApplyMsg) {
 			res = result{err: OK}
 		}
 		if op.Type != "Get" {
-			kv.dedup[op.ClientId] = lastReply{seq: op.Seq, value: res.value, err: res.err}
+			kv.dedup[op.ClientId] = lastReply{Seq: op.Seq, Value: res.value, Err: res.err}
 		}
 	}
 
