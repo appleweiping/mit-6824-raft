@@ -35,9 +35,9 @@ All numbers below are real `go test` output captured to [`results/`](results/).
 | **3A — Raft election** | Leader election | **3/3 pass** |
 | **3B — Raft log** | Log replication + fast backup | **10/10 pass** |
 | **3C — Raft persistence** | Crash recovery, Figure 8 (unreliable), churn | **8/8 pass** |
-| **3D — Raft snapshots** | Log compaction, InstallSnapshot | **8/8 pass** |
-| **4A — KV-Raft** | Fault-tolerant KV on Raft | **17/17 pass** (partitions, restarts, unreliable, linearizability) |
-| **4B — KV-Raft snapshots** | Snapshotting KV service | **10/10 pass** |
+| **3D — Raft snapshots** | Log compaction, InstallSnapshot | **7/7 pass** |
+| **4A — KV-Raft** | Fault-tolerant KV on Raft | **16/16 pass** (partitions, restarts, unreliable, linearizability) |
+| **4B — KV-Raft snapshots** | Snapshotting KV service | **9/9 pass** |
 | **5A — Shard controller** | Shard→group assignment, balanced rebalance | **12/12 pass** (incl. minimal-transfer checks) |
 | **5B — Sharded KV** | Sharded store with live migration | **9/9 pass** + 3/3 challenge tests (shard deletion, unaffected/partial-migration access) |
 
